@@ -10,6 +10,18 @@ import urllib.request
 import urllib.parse
 from datetime import datetime
 
+# Ensure sibling scripts in the same directory are importable
+_TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+
+# Step 7 auto-fill — imported from companion script
+try:
+    from ebird_add_missing_species import run_add_missing_species
+    ADD_MISSING_AVAILABLE = True
+except ImportError:
+    ADD_MISSING_AVAILABLE = False
+
 # Optional dependencies will be verified at runtime
 try:
     import torch
@@ -670,6 +682,14 @@ def main():
     # Step 6.5: Cross-check species against eBird before media upload
     run_check_missing_species(target_dir, target_dates)
 
+    # Step 7: Auto-fill missing species into eBird checklists
+    if target_dates:
+        if ADD_MISSING_AVAILABLE:
+            run_add_missing_species(target_dir, target_dates)
+        else:
+            log("⚠️ ebird_add_missing_species.py not found — skipping Step 7.")
+
+    # Step 8: Highlight checklist rows that have matching photos
     if target_dates:
         run_ebird_upload_highlight(target_dir, target_dates)
     else:
