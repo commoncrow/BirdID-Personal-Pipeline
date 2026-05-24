@@ -29,6 +29,13 @@ import urllib.request
 import urllib.parse
 from datetime import datetime
 
+# Force UTF-8 output on Windows (default console is CP1252)
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8')
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+
 try:
     import websocket
     WEBSOCKET_AVAILABLE = True
@@ -422,15 +429,15 @@ def print_report(reports):
 
 # ─── Edit-page automation ─────────────────────────────────────────────────────
 
-# JavaScript to find and focus the "Jump to species" input
+# JavaScript to find and focus the Jump-to-species input.
+# Real eBird edit page uses id='jumpToSpp', class='Suggest-input'
 _FOCUS_SPECIES_INPUT_JS = """(function() {
     var candidates = [
-        document.querySelector('#jumpToSpecies'),
-        document.querySelector('input[id*="jumpToSpecies" i]'),
+        document.querySelector('#jumpToSpp'),
+        document.querySelector('input.Suggest-input'),
+        document.querySelector('input[id*="jumpTo" i]'),
         document.querySelector('input[placeholder*="species" i]'),
-        document.querySelector('input[placeholder*="jump" i]'),
-        document.querySelector('input[aria-label*="species" i]'),
-        document.querySelector('input[placeholder*="Find" i]'),
+        document.querySelector('input[placeholder*="Enter species" i]'),
     ].filter(Boolean);
     if (!candidates.length) return null;
     var el = candidates[0];
@@ -439,7 +446,7 @@ _FOCUS_SPECIES_INPUT_JS = """(function() {
     el.value = '';
     el.dispatchEvent(new Event('input', {bubbles: true}));
     el.dispatchEvent(new Event('change', {bubbles: true}));
-    return el.placeholder || el.id || 'found';
+    return el.id || el.placeholder || 'found';
 })()"""
 
 # JavaScript to collect visible autocomplete suggestions
@@ -464,42 +471,55 @@ _AUTOCOMPLETE_JS = """(function() {
 })()"""
 
 
+def _get_edit_url(cl_url):
+    """
+    Build the correct eBird edit-species URL from a checklist URL.
+    e.g. https://ebird.org/checklist/S330727457
+      -> https://ebird.org/edit/checklist?subID=S330727457
+    Falls back to scraping the 'Edit Species' link from the checklist page.
+    """
+    import re as _re
+    m = _re.search(r'/(S\d+)', cl_url)
+    if m:
+        return f'https://ebird.org/edit/checklist?subID={m.group(1)}'
+    return None
+
+
 def navigate_to_edit(tab_ws, cl_url):
     """
-    Navigate a tab to the checklist edit page.
-    Tries /edit suffix first, then clicks the Edit button on the main page.
-    Returns True if the Jump-to-species input is found (edit mode confirmed).
+    Navigate a tab to the checklist edit-species page.
+    Returns True if the Jump-to-species input is found.
     """
-    # Attempt 1: direct /edit URL
-    edit_url = cl_url.rstrip('/') + '/edit'
-    log(f"    Navigating to edit URL: {edit_url}")
-    send_ws(tab_ws, 'Page.navigate', {'url': edit_url})
-    time.sleep(5)
-    found = js_eval(tab_ws, _FOCUS_SPECIES_INPUT_JS)
-    if found:
-        log(f"    ✅ Edit mode confirmed (input: '{found}')")
-        return True
+    edit_url = _get_edit_url(cl_url)
 
-    # Attempt 2: checklist page → click Edit button
-    log(f"    Trying Edit button on checklist page...")
-    send_ws(tab_ws, 'Page.navigate', {'url': cl_url})
-    time.sleep(4)
-    clicked = js_eval(tab_ws, """(function(){
-        var all = Array.from(document.querySelectorAll('a,button'));
-        var btn = all.find(e => /^edit$/i.test((e.innerText||'').trim())
-                              || /edit checklist/i.test(e.innerText||''));
-        if (btn) { btn.click(); return 'clicked:' + (btn.href||btn.innerText); }
-        return null;
-    })()""")
-    if clicked:
-        log(f"    Clicked: {clicked}")
+    if edit_url:
+        log(f"    Navigating to edit URL: {edit_url}")
+        send_ws(tab_ws, 'Page.navigate', {'url': edit_url})
         time.sleep(5)
         found = js_eval(tab_ws, _FOCUS_SPECIES_INPUT_JS)
         if found:
-            log(f"    ✅ Edit mode confirmed after button click (input: '{found}')")
+            log(f"    Edit mode confirmed (input: '{found}')")
             return True
 
-    log(f"    ⚠️  Could not confirm edit mode — tab left open for manual entry.")
+    # Fallback: scrape the 'Edit Species' link from the checklist page
+    log(f"    Falling back: looking for 'Edit Species' link on {cl_url}")
+    send_ws(tab_ws, 'Page.navigate', {'url': cl_url})
+    time.sleep(4)
+    scraped_url = js_eval(tab_ws, """(function(){
+        var a = Array.from(document.querySelectorAll('a'))
+                     .find(a => /edit species/i.test(a.innerText));
+        return a ? a.href : null;
+    })()""")
+    if scraped_url:
+        log(f"    Found 'Edit Species' link: {scraped_url}")
+        send_ws(tab_ws, 'Page.navigate', {'url': scraped_url})
+        time.sleep(5)
+        found = js_eval(tab_ws, _FOCUS_SPECIES_INPUT_JS)
+        if found:
+            log(f"    Edit mode confirmed via link (input: '{found}')")
+            return True
+
+    log(f"    Could not reach edit mode for {cl_url} — tab left open for manual entry.")
     return False
 
 
@@ -508,6 +528,42 @@ def _fuzzy_match(query, candidate):
     q = query.lower()
     c = candidate.lower()
     return q in c or all(w in c for w in q.split())
+
+
+def _normalize_species_for_search(name):
+    """
+    Generically normalize spelling and spacing differences between world/British taxonomy
+    and eBird's canonical American taxonomy (e.g. Grey -> Gray, compound suffix words).
+    """
+    n = name.strip()
+    
+    # 1. Global case-insensitive replacement of "Grey" -> "Gray"
+    n = re.sub(r'\bGrey\b', 'Gray', n, flags=re.IGNORECASE)
+    n = re.sub(r'\bGrey-', 'Gray-', n, flags=re.IGNORECASE)
+    
+    # 2. Generic compound word transformations (case-insensitive suffixes/mid-words)
+    replacements = [
+        # Two-word chats -> single word
+        (r'\bBush\s+Chat\b', 'Bushchat'),
+        (r'\bStone\s+Chat\b', 'Stonechat'),
+        (r'\bRock\s+Chat\b', 'Rockchat'),
+        
+        # Space-separated compounds -> hyphenated compounds
+        (r'\bRock\s+Thrush\b', 'Rock-Thrush'),
+        (r'\bTurtle\s+Dove\b', 'Turtle-Dove'),
+        (r'\bCollared\s+Dove\b', 'Collared-Dove'),
+        (r'\bBlue\s+Magpie\b', 'Blue-Magpie'),
+        (r'\bWood\s+Pigeon\b', 'Wood-Pigeon'),
+        (r'\bGreen\s+Pigeon\b', 'Green-Pigeon'),
+        (r'\bImperial\s+Pigeon\b', 'Imperial-Pigeon'),
+        (r'\bFruit\s+Dove\b', 'Fruit-Dove'),
+        (r'\bTree\s+Creeper\b', 'Treecreeper'),
+    ]
+    
+    for pattern, replacement in replacements:
+        n = re.sub(pattern, replacement, n, flags=re.IGNORECASE)
+        
+    return n
 
 
 def add_one_species(tab_ws, species_name):
@@ -522,9 +578,25 @@ def add_one_species(tab_ws, species_name):
     if not found:
         return 'no_input'
 
+    # Normalize species name to match eBird's canonical taxonomy (American English + specific compounds)
+    search_query = _normalize_species_for_search(species_name)
+
     # Type the species name — Input.insertText triggers autocomplete events
-    send_ws(tab_ws, 'Input.insertText', {'text': species_name})
+    send_ws(tab_ws, 'Input.insertText', {'text': search_query})
     time.sleep(2.5)  # wait for autocomplete dropdown
+
+    # Check for "Add Species" button and click if present (for species not on the default checklist)
+    clicked_add = js_eval(tab_ws, """(function() {
+        var btn = Array.from(document.querySelectorAll('.Suggest-empty button, button')).find(b => /Add Species/i.test(b.innerText));
+        if (btn && btn.offsetParent !== null) {
+            btn.click();
+            return true;
+        }
+        return false;
+    })()""")
+    if clicked_add:
+        log("      Found 'Add Species' button — clicking to search entire taxonomy...")
+        time.sleep(2.5)  # wait for global search results
 
     # Collect suggestions
     raw = js_eval(tab_ws, _AUTOCOMPLETE_JS)
@@ -536,8 +608,8 @@ def add_one_species(tab_ws, species_name):
         return 'no_match'
 
     first = suggestions[0].strip()
-    if not _fuzzy_match(species_name, first):
-        log(f"      ⚠️ First suggestion '{first}' doesn't match '{species_name}' — skipping")
+    if not _fuzzy_match(search_query, first):
+        log(f"      ⚠️ First suggestion '{first}' doesn't match '{search_query}' — skipping")
         press_key(tab_ws, 'Escape')
         time.sleep(0.3)
         return 'no_match'
