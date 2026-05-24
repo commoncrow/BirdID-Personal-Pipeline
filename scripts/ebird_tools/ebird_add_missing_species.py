@@ -43,8 +43,220 @@ except ImportError:
     websocket = None
     WEBSOCKET_AVAILABLE = False
 
-ET_PATH = 'C:/workspace/SuperPicky/exiftools_win/exiftool.exe'
+def find_exiftool_path():
+    """Dynamically discover ExifTool executable across Windows and macOS/Linux."""
+    script_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    
+    if sys.platform == 'win32':
+        candidates = [
+            os.path.join(script_dir, 'exiftools_win', 'exiftool.exe'),
+            'C:/workspace/SuperPicky/exiftools_win/exiftool.exe',
+            'exiftool.exe',
+            'exiftool'
+        ]
+    else:
+        # macOS or Linux
+        candidates = [
+            os.path.join(script_dir, 'exiftools_mac', 'exiftool'),
+            '/opt/homebrew/bin/exiftool',
+            '/usr/local/bin/exiftool',
+            'exiftool'
+        ]
+        
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+            
+    # Try calling 'exiftool' from PATH
+    try:
+        import subprocess
+        subprocess.run(['exiftool', '-ver'], capture_output=True, check=True, timeout=3)
+        return 'exiftool'
+    except Exception:
+        pass
+        
+    return 'C:/workspace/SuperPicky/exiftools_win/exiftool.exe' if sys.platform == 'win32' else 'exiftool'
+
+
+ET_PATH = find_exiftool_path()
 STAR_LABELS = ['3star_excellent', '2star_good']
+
+_GBIF_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'gbif_cache.json')
+
+def _load_gbif_cache():
+    if os.path.exists(_GBIF_CACHE_FILE):
+        try:
+            with open(_GBIF_CACHE_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def _save_gbif_cache(cache):
+    try:
+        with open(_GBIF_CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cache, f, indent=2)
+    except Exception:
+        pass
+
+def geocode_location(name):
+    """Query Nominatim dynamically to resolve a location name to country and state/province."""
+    if not name or name.isdigit() or len(name) < 3:
+        return None, None
+    try:
+        url = f"https://nominatim.openstreetmap.org/search?q={urllib.parse.quote(name)}&format=json&addressdetails=1&limit=1"
+        req = urllib.request.Request(url, headers={'User-Agent': 'SuperPickyLocationResolver/1.0'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            if data:
+                address = data[0].get('address', {})
+                country_code = address.get('country_code', '').upper()
+                state = address.get('state') or address.get('province') or address.get('region')
+                return country_code, state
+    except Exception as e:
+        log(f"      ⚠️ Geocoding failed for '{name}': {e}")
+    return None, None
+
+
+def get_location_config(target_dir, country_arg=None, state_arg=None):
+    """
+    Retrieve location configuration (country code and state/province) for a target directory.
+    Pauses and prompts the user if not resolved automatically.
+    """
+    if country_arg and state_arg:
+        return country_arg.upper(), state_arg
+
+    loc_file = os.path.join(target_dir, 'location.json')
+    if os.path.exists(loc_file):
+        try:
+            with open(loc_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if data.get('country') and data.get('state'):
+                    return data['country'].upper(), data['state']
+        except Exception:
+            pass
+
+    # Try path auto-detection
+    path_lower = target_dir.lower()
+    country, state = None, None
+    if "seattle" in path_lower:
+        country, state = "US", "Washington"
+    elif "solan" in path_lower:
+        country, state = "IN", "Himachal Pradesh"
+
+    # Try geocoding the folder name
+    if not country or not state:
+        folder_name = os.path.basename(os.path.normpath(target_dir))
+        # Handle date/year/upload folder names by looking at parent folder
+        if folder_name.isdigit() or re.search(r'^\d{1,2}\s+\w{3}\s+\d{4}$', folder_name) or folder_name.lower() in ['upload_ready', 'top_aesthetic']:
+            folder_name = os.path.basename(os.path.dirname(os.path.normpath(target_dir)))
+        
+        country, state = geocode_location(folder_name)
+
+    # 🛑 Pause and demand location if still unresolved in interactive mode
+    if (not country or not state) and sys.stdin.isatty():
+        print(f"\n🌍 Location could not be auto-detected for: '{os.path.basename(target_dir)}'")
+        print("   Please enter the location details to enable GBIF occurrence validation.")
+        while not country or not state:
+            try:
+                if not country:
+                    country = input("   👉 Enter Country Code (2 letters, e.g. US, IN): ").strip().upper()
+                if not state:
+                    state = input("   👉 Enter State/Province (e.g. Washington, Himachal Pradesh): ").strip()
+                
+                if not country or not state:
+                    print("   ❌ Both Country and State are required to proceed. Please enter them.")
+            except (KeyboardInterrupt, EOFError):
+                print("\n   ⚠️ Prompt cancelled. Validation will run without location.")
+                break
+
+    # Cache the resolved location so you only enter it once
+    if country and state:
+        try:
+            with open(loc_file, 'w', encoding='utf-8') as f:
+                json.dump({'country': country, 'state': state}, f, indent=2)
+            log(f"💾 Saved location configuration to: {loc_file}")
+        except Exception:
+            pass
+
+    return country, state
+
+
+_warned_no_location = False
+
+
+def is_species_plausible_for_location(species_name, folder_path, country=None, state=None, month=None):
+    """
+    Query GBIF dynamically to check if the species has substantial records
+    in the target country/state during the specified month(s),
+    flagging rare/accidental/misclassified species.
+    """
+    global _warned_no_location
+
+    # Try to load from target location config if not passed directly
+    if not country or not state:
+        country, state = get_location_config(folder_path)
+
+    # Safe fallback if still unresolved
+    if not country or not state:
+        if not _warned_no_location:
+            log(f"⚠️ Warning: Location details could not be resolved for: {os.path.basename(folder_path)}")
+            log("   GBIF occurrence validation will be skipped. All species will default to 'plausible'.")
+            _warned_no_location = True
+        return True
+
+    # Build the list of target months (include adjacent 2 months back and forth to tolerate migration shifts)
+    months = []
+    if month is not None:
+        if isinstance(month, int):
+            expanded = set()
+            for offset in [-2, -1, 0, 1, 2]:
+                m = (month + offset - 1) % 12 + 1
+                expanded.add(m)
+            months = sorted(list(expanded))
+        elif isinstance(month, list):
+            expanded = set()
+            for m in month:
+                for offset in [-2, -1, 0, 1, 2]:
+                    val = (m + offset - 1) % 12 + 1
+                    expanded.add(val)
+            months = sorted(list(expanded))
+
+    months_str = ",".join(str(m) for m in months) if months else "all"
+    cache = _load_gbif_cache()
+    cache_key = f"{species_name}||{country}||{state}||{months_str}"
+    if cache_key in cache:
+        return cache[cache_key]
+
+    try:
+        # Match vernacular species name to taxonomy
+        url = f"https://api.gbif.org/v1/species/search?q={urllib.parse.quote(species_name)}"
+        req = urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'SuperPicky/1.0'}))
+        res = json.loads(req.read().decode('utf-8'))
+        results = res.get('results', [])
+        if not results:
+            scientific_name = species_name
+        else:
+            scientific_name = results[0].get('canonicalName', species_name)
+
+        # Search occurrences in the detected country and state/province
+        occ_url = f"https://api.gbif.org/v1/occurrence/search?scientificName={urllib.parse.quote(scientific_name)}&country={country}&stateProvince={urllib.parse.quote(state)}&limit=1"
+        for m in months:
+            occ_url += f"&month={m}"
+
+        req_occ = urllib.request.urlopen(urllib.request.Request(occ_url, headers={'User-Agent': 'SuperPicky/1.0'}))
+        res_occ = json.loads(req_occ.read().decode('utf-8'))
+        count = res_occ.get('count', 0)
+
+        # Plausible if we have 200 or more records
+        plausible = count >= 200
+
+        cache[cache_key] = plausible
+        _save_gbif_cache(cache)
+        return plausible
+    except Exception as e:
+        log(f"      ⚠️ GBIF Query failed for '{species_name}': {e}. Defaulting to plausible.")
+        return True
 
 
 def log(msg):
@@ -53,50 +265,79 @@ def log(msg):
 
 # ─── ExifTool helpers ─────────────────────────────────────────────────────────
 
-def scan_shooting_dates(target_dir):
-    """Return sorted list of shooting date strings like '14 Jan 2026'."""
+def collect_species_by_date(target_dir):
+    """
+    Scan all JPG/JPEG files in target_dir using ExifTool.
+    Return a dict mapping date string (e.g. '02 May 2026') -> set of species photographed on that date,
+    and a set of all photographed species.
+    """
     env = os.environ.copy()
     env['PYTHONIOENCODING'] = 'utf-8'
     args = [ET_PATH, '-r', '-DateTimeOriginal', '-j',
-            '-ext', 'jpg', '-ext', 'JPG', target_dir]
+            '-ext', 'jpg', '-ext', 'JPG', '-ext', 'jpeg', '-ext', 'JPEG', target_dir]
     result = subprocess.run(args, capture_output=True, text=True,
                             encoding='utf-8', env=env)
-    dates = set()
+    
+    date_to_species = {}
+    all_species = set()
+    
     try:
-        for item in json.loads(result.stdout):
-            raw = item.get('DateTimeOriginal', '')
-            if raw:
-                try:
-                    dates.add(datetime.strptime(raw[:10], '%Y:%m:%d')
-                              .strftime('%d %b %Y'))
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    return sorted(dates)
+        data = json.loads(result.stdout)
+    except Exception as e:
+        log(f"  ⚠️ Failed to parse ExifTool json: {e}")
+        data = []
+        
+    for item in data:
+        raw_path = item.get('SourceFile', '')
+        raw_date = item.get('DateTimeOriginal', '')
+        if not raw_path or not raw_date:
+            continue
+            
+        # Parse date
+        try:
+            ds = datetime.strptime(raw_date[:10], '%Y:%m:%d').strftime('%d %b %Y')
+        except Exception:
+            continue
+            
+        # Parse species name from path
+        norm_path = raw_path.replace('\\', '/')
+        parts = norm_path.split('/')
+        
+        star_idx = -1
+        for idx, part in enumerate(parts):
+            if part in STAR_LABELS:
+                star_idx = idx
+                break
+                
+        if star_idx == -1 or star_idx + 1 >= len(parts):
+            continue
+            
+        sp_part = parts[star_idx + 1]
+        if sp_part == 'Other_Birds' and star_idx + 2 < len(parts):
+            species_name = parts[star_idx + 2]
+        else:
+            species_name = sp_part
+            
+        # Exclude files directly in the species dir or other files
+        if '.' in species_name or species_name.lower().endswith(('.jpg', '.jpeg')):
+            continue
+            
+        date_to_species.setdefault(ds, set()).add(species_name)
+        all_species.add(species_name)
+        
+    return date_to_species, all_species
 
 
-# ─── Folder helpers ───────────────────────────────────────────────────────────
+def scan_shooting_dates(target_dir):
+    """Return sorted list of shooting date strings like '14 Jan 2026'."""
+    date_to_species, _ = collect_species_by_date(target_dir)
+    return sorted(list(date_to_species.keys()))
+
 
 def collect_photographed_species(target_dir):
     """Return set of bird species names from 3star/2star folder structure."""
-    species = set()
-    for label in STAR_LABELS:
-        d = os.path.join(target_dir, label)
-        if not os.path.isdir(d):
-            continue
-        for item in os.listdir(d):
-            full = os.path.join(d, item)
-            if not os.path.isdir(full):
-                continue
-            if item == 'Other_Birds':
-                # BirdID-classified subdirs live here
-                for sub in os.listdir(full):
-                    if os.path.isdir(os.path.join(full, sub)) and sub != 'Other_Birds':
-                        species.add(sub)
-            else:
-                species.add(item)
-    return species
+    _, all_species = collect_species_by_date(target_dir)
+    return all_species
 
 
 def find_processed_folders(root_dir):
@@ -175,6 +416,50 @@ def js_eval(ws, expr):
     return r.get('result', {}).get('result', {}).get('value')
 
 
+def wait_for_js_condition(ws, expr, timeout=10.0, poll_interval=0.1):
+    """Poll a JS expression until it returns a truthy value or timeout is reached."""
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            val = js_eval(ws, expr)
+            if val:
+                return val
+        except Exception:
+            pass
+        time.sleep(poll_interval)
+    return None
+
+
+def wait_for_page_load(ws, timeout=12.0):
+    """Wait for document.readyState to be 'complete'."""
+    return wait_for_js_condition(ws, 'document.readyState === "complete"', timeout=timeout)
+
+
+def wait_for_autocomplete(ws, timeout=3.0, poll_interval=0.1):
+    """Wait until autocomplete suggestions appear or empty state button is visible."""
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            raw = js_eval(ws, _AUTOCOMPLETE_JS)
+            suggestions = json.loads(raw) if raw else []
+            if suggestions:
+                return suggestions
+            empty_present = js_eval(ws, """(function() {
+                var btn = Array.from(document.querySelectorAll('.Suggest-empty button, button')).find(b => /Add Species/i.test(b.innerText));
+                return !!btn;
+            })()""")
+            if empty_present:
+                break
+        except Exception:
+            pass
+        time.sleep(poll_interval)
+    try:
+        raw = js_eval(ws, _AUTOCOMPLETE_JS)
+        return json.loads(raw) if raw else []
+    except Exception:
+        return []
+
+
 def press_key(ws, key, code=None):
     """Simulate a key press (down + up)."""
     for ktype in ('keyDown', 'keyUp'):
@@ -185,6 +470,23 @@ def press_key(ws, key, code=None):
     time.sleep(0.08)
 
 
+def type_via_js(ws, selector, text):
+    """Set value of input using React-compatible native setter and dispatch events."""
+    js = f"""(function() {{
+        var el = document.querySelector({json.dumps(selector)});
+        if (!el) return false;
+        el.focus();
+        var nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+        nativeSetter.call(el, {json.dumps(text)});
+        el.dispatchEvent(new Event('input', {{bubbles: true}}));
+        el.dispatchEvent(new Event('change', {{bubbles: true}}));
+        return true;
+    }})()"""
+    res = js_eval(ws, js)
+    time.sleep(0.3)
+    return res
+
+
 # ─── eBird checklist discovery ────────────────────────────────────────────────
 
 def find_checklists_for_dates(target_dates):
@@ -192,17 +494,20 @@ def find_checklists_for_dates(target_dates):
     Navigate mychecklists and return {date_str: [url, ...]} for target_dates.
     Requires Chrome to already have a page tab.
     """
-    ws_url = get_ws_url()
+    tab = None
+    try:
+        tab = open_tab('about:blank')
+        ws_url = tab['webSocketDebuggerUrl']
+    except Exception:
+        ws_url = get_ws_url()
+
     if not ws_url:
         return {}
 
     ws = websocket.create_connection(ws_url, origin='http://localhost:9222')
     send_ws(ws, 'Page.navigate', {
         'url': 'https://ebird.org/mychecklists?currentRow=1&sortBy=date&o=desc'})
-    time.sleep(6)
-    ws_url = get_ws_url()
-    ws.close()
-    ws = websocket.create_connection(ws_url, origin='http://localhost:9222')
+    wait_for_page_load(ws)
 
     found = {}
     oldest_target = min(datetime.strptime(d, '%d %b %Y') for d in target_dates)
@@ -211,7 +516,7 @@ def find_checklists_for_dates(target_dates):
         log(f"  Scanning mychecklists row {start_row}–{start_row + 19}...")
         send_ws(ws, 'Page.navigate', {
             'url': f'https://ebird.org/mychecklists?currentRow={start_row}&sortBy=date&o=desc'})
-        time.sleep(5)
+        wait_for_page_load(ws)
 
         r = send_ws(ws, 'Runtime.evaluate', {'expression': """(function(){
             var links = document.querySelectorAll("a[href*='/checklist/S']");
@@ -250,16 +555,23 @@ def find_checklists_for_dates(target_dates):
             break
 
     ws.close()
+    if tab:
+        try:
+            close_tab(tab['id'])
+        except Exception:
+            pass
     return found
 
 
-def extract_species_from_checklist(cl_url):
-    """Open checklist in a new tab, extract species names, close tab."""
+def extract_species_and_location(cl_url):
+    """Open checklist, extract species and eBird region breadcrumbs, close tab."""
     try:
         tab = open_tab(cl_url)
-        time.sleep(4)
         tw = websocket.create_connection(
             tab['webSocketDebuggerUrl'], origin='http://localhost:9222')
+        wait_for_page_load(tw)
+            
+        # 1. Extract species
         r = send_ws(tw, 'Runtime.evaluate', {'expression': """(function(){
             var names = new Set();
             document.querySelectorAll("a[href*='/species/']").forEach(e=>names.add(e.innerText.trim()));
@@ -269,12 +581,39 @@ def extract_species_from_checklist(cl_url):
         })()""", 'returnByValue': True})
         val = r.get('result', {}).get('result', {}).get('value', '[]')
         species = set(json.loads(val))
+        
+        # 2. Extract location breadcrumbs
+        r_loc = send_ws(tw, 'Runtime.evaluate', {'expression': """(function(){
+            var breadcrumbs = [];
+            document.querySelectorAll('a[href*="/region/"]').forEach(function(a) {
+                var m = a.href.match(/\\/region\\/([A-Z]{2}(?:-[A-Z0-9]+){0,2})$/i);
+                if (m) {
+                    breadcrumbs.push({
+                        code: m[1],
+                        text: a.innerText.trim()
+                    });
+                }
+            });
+            return JSON.stringify(breadcrumbs);
+        })()""", 'returnByValue': True})
+        loc_val = r_loc.get('result', {}).get('result', {}).get('value', '[]')
+        crumbs = json.loads(loc_val)
+        
+        location = {'country': None, 'state': None}
+        for c in crumbs:
+            code = c['code']
+            parts = code.split('-')
+            if len(parts) == 1 and len(parts[0]) == 2:
+                location['country'] = parts[0].upper()
+            elif len(parts) == 2:
+                location['state'] = c['text']
+                
         tw.close()
         close_tab(tab['id'])
-        return species
+        return species, location
     except Exception as e:
         log(f"  ⚠️ Error reading {cl_url}: {e}")
-        return set()
+        return set(), {'country': None, 'state': None}
 
 
 # ─── Report builder ───────────────────────────────────────────────────────────
@@ -316,12 +655,15 @@ def build_missing_report(root_dir):
     all_target_dates = set()
     folder_meta = []
     for folder in folders:
-        photographed = collect_photographed_species(folder)
-        dates = scan_shooting_dates(folder)
+        date_to_species, photographed = collect_species_by_date(folder)
+        dates = sorted(list(date_to_species.keys()))
         all_target_dates.update(dates)
-        folder_meta.append({'folder': folder,
-                            'photographed': photographed,
-                            'dates': dates})
+        folder_meta.append({
+            'folder': folder,
+            'photographed': photographed,
+            'date_to_species': date_to_species,
+            'dates': dates
+        })
         log(f"  {os.path.basename(folder)}: "
             f"{len(photographed)} species, {len(dates)} shooting dates")
 
@@ -345,17 +687,30 @@ def build_missing_report(root_dir):
     all_urls = [u for urls in all_checklists.values() for u in urls]
     log(f"Fetching species from {len(all_urls)} checklist(s)...")
     checklist_species = {}
+    detected_country = None
+    detected_state = None
     for url in all_urls:
         log(f"  → {url}")
-        checklist_species[url] = extract_species_from_checklist(url)
-        log(f"    {len(checklist_species[url])} species")
+        species, loc = extract_species_and_location(url)
+        checklist_species[url] = species
+        log(f"    {len(species)} species")
+        if not detected_country and loc.get('country') and loc.get('state'):
+            detected_country = loc['country']
+            detected_state = loc['state']
+            log(f"    🌍 Detected eBird location: {detected_state}, {detected_country}")
 
     # Build per-folder report
     reports = []
     for fm in folder_meta:
         folder = fm['folder']
         photographed = fm['photographed']
+        date_to_species = fm['date_to_species']
         dates = fm['dates']
+
+        folder_country = detected_country
+        folder_state = detected_state
+        if not folder_country or not folder_state:
+            folder_country, folder_state = get_location_config(folder)
 
         per_date = {}
         for ds in dates:
@@ -365,12 +720,30 @@ def build_missing_report(root_dir):
             # Largest = most species already logged
             best = max(urls, key=lambda u: len(checklist_species.get(u, set())))
             present_in_best = checklist_species.get(best, set())
+            
+            # Use only species photographed on this specific date
+            todays_photographed = date_to_species.get(ds, set())
+            missing_raw = todays_photographed - present_in_best
+            
+            missing_valid = set()
+            flagged = set()
+            for sp in missing_raw:
+                try:
+                    m_val = datetime.strptime(ds, '%d %b %Y').month
+                except Exception:
+                    m_val = None
+                if is_species_plausible_for_location(sp, folder, country=folder_country, state=folder_state, month=m_val):
+                    missing_valid.add(sp)
+                else:
+                    flagged.add(sp)
+            
             per_date[ds] = {
                 'best_cl': best,
                 'all_cls': urls,
                 'cl_species_count': len(present_in_best),
-                'missing': photographed - present_in_best,
-                'present': photographed & present_in_best,
+                'missing': missing_valid,
+                'flagged': flagged,
+                'present': todays_photographed & present_in_best,
             }
 
         reports.append({
@@ -413,7 +786,10 @@ def print_report(reports):
                 print(f"      🐦 Missing ({len(pd['missing'])}): "
                       f"{', '.join(sorted(pd['missing']))}")
             else:
-                print(f"      ✅ All {len(pd['present'])} photographed species present!")
+                print(f"      ✅ All photographed species present!")
+            if pd.get('flagged'):
+                print(f"      ⚠️  Flagged & Ignored ({len(pd['flagged'])}): "
+                      f"{', '.join(sorted(pd['flagged']))}")
             if pd['present']:
                 print(f"      ✓  Present ({len(pd['present'])}): "
                       f"{', '.join(sorted(pd['present']))}")
@@ -464,7 +840,11 @@ _AUTOCOMPLETE_JS = """(function() {
         var els = Array.from(document.querySelectorAll(s))
                        .filter(e => e.offsetParent !== null);
         if (els.length > 0) {
-            return JSON.stringify(els.slice(0, 5).map(e => e.innerText.trim()));
+            var items = els.slice(0, 5).map(e => e.innerText.trim());
+            items = items.filter(s => !/no matches|no species/i.test(s));
+            if (items.length > 0) {
+                return JSON.stringify(items);
+            }
         }
     }
     return '[]';
@@ -495,8 +875,8 @@ def navigate_to_edit(tab_ws, cl_url):
     if edit_url:
         log(f"    Navigating to edit URL: {edit_url}")
         send_ws(tab_ws, 'Page.navigate', {'url': edit_url})
-        time.sleep(5)
-        found = js_eval(tab_ws, _FOCUS_SPECIES_INPUT_JS)
+        wait_for_page_load(tab_ws)
+        found = wait_for_js_condition(tab_ws, _FOCUS_SPECIES_INPUT_JS, timeout=5.0)
         if found:
             log(f"    Edit mode confirmed (input: '{found}')")
             return True
@@ -504,7 +884,7 @@ def navigate_to_edit(tab_ws, cl_url):
     # Fallback: scrape the 'Edit Species' link from the checklist page
     log(f"    Falling back: looking for 'Edit Species' link on {cl_url}")
     send_ws(tab_ws, 'Page.navigate', {'url': cl_url})
-    time.sleep(4)
+    wait_for_page_load(tab_ws)
     scraped_url = js_eval(tab_ws, """(function(){
         var a = Array.from(document.querySelectorAll('a'))
                      .find(a => /edit species/i.test(a.innerText));
@@ -513,8 +893,8 @@ def navigate_to_edit(tab_ws, cl_url):
     if scraped_url:
         log(f"    Found 'Edit Species' link: {scraped_url}")
         send_ws(tab_ws, 'Page.navigate', {'url': scraped_url})
-        time.sleep(5)
-        found = js_eval(tab_ws, _FOCUS_SPECIES_INPUT_JS)
+        wait_for_page_load(tab_ws)
+        found = wait_for_js_condition(tab_ws, _FOCUS_SPECIES_INPUT_JS, timeout=5.0)
         if found:
             log(f"    Edit mode confirmed via link (input: '{found}')")
             return True
@@ -566,26 +946,86 @@ def _normalize_species_for_search(name):
     return n
 
 
-def add_one_species(tab_ws, species_name):
+def load_species_counts(target_dir):
+    """Load custom species counts map from location.json in the target directory."""
+    counts_map = {}
+    loc_file = os.path.join(target_dir, 'location.json')
+    if os.path.exists(loc_file):
+        try:
+            with open(loc_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                raw_counts = data.get('counts', {})
+                counts_map = {k.strip(): str(v).upper() for k, v in raw_counts.items()}
+        except Exception:
+            pass
+    return counts_map
+
+
+def get_scientific_name(species_name):
+    """Query GBIF dynamically to get the canonical scientific name for a species."""
+    try:
+        url = f"https://api.gbif.org/v1/species/search?q={urllib.parse.quote(species_name)}"
+        req = urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'SuperPicky/1.0'}))
+        res = json.loads(req.read().decode('utf-8'))
+        results = res.get('results', [])
+        if results:
+            return results[0].get('canonicalName', species_name)
+    except Exception:
+        pass
+    return species_name
+
+
+def load_country_spelling_cache(country_code):
+    """Load spelling cache for a specific country."""
+    if not country_code:
+        return {}
+    cache_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"spelling_cache_{country_code.upper()}.json")
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_country_spelling_cache(country_code, cache):
+    """Save spelling cache for a specific country."""
+    if not country_code:
+        return
+    cache_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"spelling_cache_{country_code.upper()}.json")
+    try:
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(cache, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def add_one_species(tab_ws, species_name, count="X", country_code=None):
     """
     Type species_name into the Jump-to-species box, select the first
-    autocomplete match, enter count = 1.
-
-    Returns: 'ok' | 'no_input' | 'no_match'
+    autocomplete match, enter count. If name has no autocomplete match,
+    infers canonical eBird name using scientific name and updates the country spelling cache.
     """
-    # Re-focus and clear the input before each species
+    # 1. Load country spelling cache
+    cache = load_country_spelling_cache(country_code)
+
+    # 2. Re-focus and clear the input before each species
     found = js_eval(tab_ws, _FOCUS_SPECIES_INPUT_JS)
     if not found:
         return 'no_input'
 
-    # Normalize species name to match eBird's canonical taxonomy (American English + specific compounds)
-    search_query = _normalize_species_for_search(species_name)
+    # 3. Check if cached
+    search_query = cache.get(species_name)
+    if not search_query:
+        # Fall back to baseline normalizations
+        search_query = _normalize_species_for_search(species_name)
 
-    # Type the species name — Input.insertText triggers autocomplete events
-    send_ws(tab_ws, 'Input.insertText', {'text': search_query})
-    time.sleep(2.5)  # wait for autocomplete dropdown
+    # 4. Type the search query
+    type_via_js(tab_ws, '#jumpToSpp', search_query)
+    suggestions = wait_for_autocomplete(tab_ws)
 
-    # Check for "Add Species" button and click if present (for species not on the default checklist)
+    # 5. Check if "Add Species" button is present and click it (global checklist taxonomy search)
     clicked_add = js_eval(tab_ws, """(function() {
         var btn = Array.from(document.querySelectorAll('.Suggest-empty button, button')).find(b => /Add Species/i.test(b.innerText));
         if (btn && btn.offsetParent !== null) {
@@ -596,42 +1036,193 @@ def add_one_species(tab_ws, species_name):
     })()""")
     if clicked_add:
         log("      Found 'Add Species' button — clicking to search entire taxonomy...")
-        time.sleep(2.5)  # wait for global search results
+        suggestions = wait_for_autocomplete(tab_ws, timeout=6.0)
 
-    # Collect suggestions
-    raw = js_eval(tab_ws, _AUTOCOMPLETE_JS)
-    suggestions = json.loads(raw) if raw else []
-
+    # 6. Collect suggestions
     if not suggestions:
-        log(f"      ⚠️ No autocomplete results for '{species_name}' — skipping")
+        raw = js_eval(tab_ws, _AUTOCOMPLETE_JS)
+        suggestions = json.loads(raw) if raw else []
+
+    # 7. Check if suggestion matches
+    matched_common_name = None
+    if suggestions:
+        first = suggestions[0].strip()
+        first_clean = first.split(" - ")[0].strip()
+        if _fuzzy_match(search_query, first_clean):
+            matched_common_name = first_clean
+
+    # 8. 🚨 INFERENCE FALLBACK: If no match, try scientific name!
+    if not matched_common_name:
+        log(f"      ⚠️ No match for '{search_query}'. Resolving scientific name from GBIF...")
+        sci_name = get_scientific_name(species_name)
+        if sci_name and sci_name != species_name:
+            log(f"      👉 Retrying autocomplete with scientific name: '{sci_name}'")
+            # Clear input and type scientific name
+            type_via_js(tab_ws, '#jumpToSpp', sci_name)
+            suggestions = wait_for_autocomplete(tab_ws)
+
+            # Click Add Species if needed
+            clicked_add = js_eval(tab_ws, """(function() {
+                var btn = Array.from(document.querySelectorAll('.Suggest-empty button, button')).find(b => /Add Species/i.test(b.innerText));
+                if (btn && btn.offsetParent !== null) {
+                    btn.click();
+                    return true;
+                }
+                return false;
+            })()""")
+            if clicked_add:
+                suggestions = wait_for_autocomplete(tab_ws, timeout=6.0)
+
+            # Collect suggestions again
+            if not suggestions:
+                raw = js_eval(tab_ws, _AUTOCOMPLETE_JS)
+                suggestions = json.loads(raw) if raw else []
+            if suggestions:
+                first = suggestions[0].strip()
+                first_clean = first.split(" - ")[0].strip()
+                if "no matches" not in first_clean.lower() and "no species" not in first_clean.lower():
+                    matched_common_name = first_clean
+                    log(f"      💡 Successfully inferred eBird name: '{matched_common_name}' from scientific name '{sci_name}'")
+
+    if not matched_common_name:
+        log(f"      ❌ Could not resolve eBird name for '{species_name}' — skipping")
         press_key(tab_ws, 'Escape')
         return 'no_match'
 
-    first = suggestions[0].strip()
-    if not _fuzzy_match(search_query, first):
-        log(f"      ⚠️ First suggestion '{first}' doesn't match '{search_query}' — skipping")
-        press_key(tab_ws, 'Escape')
+    log(f"      ✓ Autocomplete matched: '{matched_common_name}'")
+
+    # Save to country spelling cache if we learned a new mapping!
+    if country_code and species_name not in cache:
+        cache[species_name] = matched_common_name
+        save_country_spelling_cache(country_code, cache)
+        log(f"      💾 Learned & Cached spelling mapping: '{species_name}' ➔ '{matched_common_name}' ({country_code.upper()})")
+
+    # Click the first autocomplete suggestion directly (more reliable than ArrowDown+Enter)
+    click_result = js_eval(tab_ws, """(function() {
+        var selectors = [
+            '[role="listbox"] [role="option"]',
+            '[role="option"]',
+            'ul[class*="suggest"] li',
+            'ul[class*="autocomplete"] li',
+            '.tt-suggestion',
+            '[class*="suggestion"]',
+            '[class*="autocomplete"] li',
+        ];
+        for (var s of selectors) {
+            var els = Array.from(document.querySelectorAll(s))
+                           .filter(e => e.offsetParent !== null && !/no matches|no species/i.test(e.innerText));
+            if (els.length > 0) {
+                els[0].click();
+                return 'clicked';
+            }
+        }
+        return null;
+    })()""")
+
+    if not click_result:
+        # Fallback: ArrowDown + Enter
+        press_key(tab_ws, 'ArrowDown', 'ArrowDown')
         time.sleep(0.3)
-        return 'no_match'
+        press_key(tab_ws, 'Enter', 'Enter')
 
-    log(f"      ✓ Autocomplete matched: '{first}'")
+    # Give eBird React time to render the newly added species row
+    time.sleep(1.5)
 
-    # Select first suggestion: ArrowDown → Enter
-    press_key(tab_ws, 'ArrowDown', 'ArrowDown')
+    # Snapshot input.sc count before — lets us detect newly added row as fallback
+    sc_count_before = js_eval(tab_ws, "document.querySelectorAll('input.sc').length") or 0
+
+    # Extract clean common name (strip scientific name suffix for DOM search)
+    clean_name = matched_common_name.split('(')[0].strip()
+    # Strip any trailing scientific name (capitalised binomial after the common name)
+    import re as _re
+    clean_name = _re.sub(r'\s+[A-Z][a-z]+ [a-z]+.*$', '', clean_name).strip()
+    log(f"      🔍 Searching for count input in row: '{clean_name}' (sc_before={sc_count_before})")
+
+    # Wait for the species row with the matched name to appear (real eBird count inputs have class 'sc')
+    row_appeared = wait_for_js_condition(tab_ws, f"""(function() {{
+        var name = {json.dumps(clean_name)}.toLowerCase();
+        var allText = Array.from(document.querySelectorAll('td, th, label, span, div'));
+        for (var el of allText) {{
+            var txt = (el.innerText || el.textContent || '').trim();
+            if (txt.toLowerCase().indexOf(name) !== -1 && txt.length < name.length + 35) {{
+                var row = el.closest('.SubmitChecklist-species, tr, li') || el.parentElement;
+                if (row) {{
+                    var inp = row.querySelector('input.sc, input[name*="count"]');
+                    if (inp) return 'ready';
+                }}
+            }}
+        }}
+        return null;
+    }})()""", timeout=5.0)
+
+    # Find the count input (class 'sc') in the row that contains the species name text.
+    # Skip if a value is already set — don't override what the user has entered.
+    count_set = js_eval(tab_ws, f"""(function() {{
+        var name = {json.dumps(clean_name)}.toLowerCase();
+        var allText = Array.from(document.querySelectorAll('td, th, label, span, div'));
+        for (var el of allText) {{
+            var txt = (el.innerText || el.textContent || '').trim();
+            if (txt.toLowerCase().indexOf(name) !== -1 && txt.length < name.length + 35) {{
+                var row = el.closest('.SubmitChecklist-species, tr, li') || el.parentElement;
+                if (!row) continue;
+                var inp = row.querySelector('input.sc, input[name*="count"]');
+                if (!inp) continue;
+                // Always highlight the row green for easy review
+                row.style.backgroundColor = '#e8f5e9';
+                row.style.borderLeft = '5px solid #2e7d32';
+                row.style.transition = 'background-color 0.3s';
+                // Don't override an existing non-empty value
+                var existing = (inp.value || '').trim();
+                if (existing !== '' && existing !== '0') {{
+                    return 'already_set';
+                }}
+                inp.focus();
+                var nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                nativeSetter.call(inp, {json.dumps(str(count))});
+                inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                inp.blur();
+                return 'set';
+            }}
+        }}
+        return false;
+    }})()""")
+
+    if count_set == 'already_set':
+        log(f"      ℹ️  Count already set for '{species_name}' — keeping existing value")
+    elif not count_set:
+        # Fallback: use the newly added input.sc (detected by snapshot count)
+        fallback_set = js_eval(tab_ws, f"""(function() {{
+            var inputs = Array.from(document.querySelectorAll('input.sc'));
+            if (inputs.length <= {sc_count_before}) return false;
+            var inp = inputs[{sc_count_before}];  // the first newly added one
+            inp.style.outline = '3px solid #2e7d32';  // highlight it visually
+            var row = inp.closest('tr') || inp.parentElement;
+            if (row) {{ row.style.backgroundColor = '#e8f5e9'; row.style.borderLeft = '5px solid #2e7d32'; }}
+            var existing = (inp.value || '').trim();
+            if (existing !== '' && existing !== '0') return 'already_set';
+            inp.focus();
+            var ns = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            ns.call(inp, {json.dumps(str(count))});
+            inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+            inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+            inp.blur();
+            return 'set';
+        }})()""")
+        if fallback_set in ('set', 'already_set'):
+            log(f"      ✅ Count set via fallback (sc index {sc_count_before}) for '{species_name}'")
+        else:
+            log(f"      ⚠️ Could not find count input in species row for '{species_name}' — count not entered")
+
     time.sleep(0.3)
-    press_key(tab_ws, 'Enter', 'Enter')
-    time.sleep(1.2)  # wait for species row to appear + count field to focus
-
-    # Enter count = 1  (eBird focuses the count field after species selection)
-    send_ws(tab_ws, 'Input.insertText', {'text': '1'})
-    time.sleep(0.3)
-    press_key(tab_ws, 'Tab', 'Tab')
-    time.sleep(0.5)
+    press_key(tab_ws, 'Escape', 'Escape')  # dismiss any open dropdown
+    time.sleep(0.2)
 
     return 'ok'
 
 
-def auto_fill_checklist(cl_url, missing_species):
+
+def auto_fill_checklist(cl_url, missing_species, counts_map=None, country_code=None):
     """
     Open the checklist edit page in a new tab and auto-fill all missing species.
     Tab is left open for user review — nothing is saved automatically.
@@ -640,9 +1231,9 @@ def auto_fill_checklist(cl_url, missing_species):
     """
     log(f"\n    Opening edit tab: {cl_url}")
     tab = open_tab(cl_url)
-    time.sleep(3)
     tab_ws = websocket.create_connection(
         tab['webSocketDebuggerUrl'], origin='http://localhost:9222')
+    wait_for_page_load(tab_ws)
 
     results = {'ok': [], 'no_match': [], 'error': []}
 
@@ -652,10 +1243,14 @@ def auto_fill_checklist(cl_url, missing_species):
         tab_ws.close()
         return results
 
+    if counts_map is None:
+        counts_map = {}
+
     for sp in sorted(missing_species):
-        log(f"    ➕ Adding: {sp}")
+        count = counts_map.get(sp, "X")
+        log(f"    ➕ Adding: {sp} (Present status/count: '{count}')")
         try:
-            outcome = add_one_species(tab_ws, sp)
+            outcome = add_one_species(tab_ws, sp, count=count, country_code=country_code)
             results[outcome].append(sp)
         except Exception as e:
             log(f"    ❌ Error adding '{sp}': {e}")
@@ -692,7 +1287,7 @@ def run_add_missing_species(target_dir, target_dates):
         log("   Start Chrome with: --remote-debugging-port=9222")
         return
 
-    photographed = collect_photographed_species(target_dir)
+    date_to_species, photographed = collect_species_by_date(target_dir)
     if not photographed:
         log("ℹ️ No species folders found — skipping.")
         return
@@ -711,22 +1306,45 @@ def run_add_missing_species(target_dir, target_dates):
     all_urls = [u for urls in found_checklists.values() for u in urls]
     log(f"Scanning {len(all_urls)} checklist(s) for existing species...")
     checklist_species = {}
+    detected_country = None
+    detected_state = None
     for url in all_urls:
-        checklist_species[url] = extract_species_from_checklist(url)
+        species, loc = extract_species_and_location(url)
+        checklist_species[url] = species
+        if not detected_country and loc.get('country') and loc.get('state'):
+            detected_country = loc['country']
+            detected_state = loc['state']
+            log(f"    🌍 Detected eBird location: {detected_state}, {detected_country}")
+
+    # Load from folder location config if eBird location scraping failed
+    folder_country = detected_country
+    folder_state = detected_state
+    if not folder_country or not folder_state:
+        folder_country, folder_state = get_location_config(target_dir)
 
     # Per-date: pick the largest checklist, compute missing, auto-fill
     all_results = {}
     for ds in sorted(found_checklists, key=lambda d: datetime.strptime(d, '%d %b %Y')):
         urls = found_checklists[ds]
         best = max(urls, key=lambda u: len(checklist_species.get(u, set())))
-        missing = photographed - checklist_species.get(best, set())
+        
+        # Use only species photographed on this specific date
+        todays_photographed = date_to_species.get(ds, set())
+        missing_raw = todays_photographed - checklist_species.get(best, set())
+        
+        try:
+            m_val = datetime.strptime(ds, '%d %b %Y').month
+        except Exception:
+            m_val = None
+        missing = {sp for sp in missing_raw if is_species_plausible_for_location(sp, target_dir, country=folder_country, state=folder_state, month=m_val)}
 
         if not missing:
             log(f"  {ds}: ✅ All species present in checklist — skipping.")
             continue
 
         log(f"  {ds}: {len(missing)} missing → targeting {best}")
-        result = auto_fill_checklist(best, missing)
+        counts_map = load_species_counts(target_dir)
+        result = auto_fill_checklist(best, missing, counts_map=counts_map, country_code=folder_country)
         all_results[ds] = {'url': best, 'result': result, 'missing': missing}
 
     # Final summary
@@ -755,7 +1373,7 @@ def run_add_missing_species(target_dir, target_dates):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python ebird_add_missing_species.py <dir> [--report-only]")
+        print("Usage: python ebird_add_missing_species.py <dir> [--report-only] [--country <CODE>] [--state <NAME>]")
         sys.exit(1)
 
     root_dir = os.path.abspath(sys.argv[1])
@@ -764,6 +1382,20 @@ def main():
     if not os.path.isdir(root_dir):
         print(f"Error: {root_dir} is not a directory")
         sys.exit(1)
+
+    country_arg = None
+    state_arg = None
+    if "--country" in sys.argv:
+        idx = sys.argv.index("--country")
+        if idx + 1 < len(sys.argv):
+            country_arg = sys.argv[idx + 1]
+    if "--state" in sys.argv:
+        idx = sys.argv.index("--state")
+        if idx + 1 < len(sys.argv):
+            state_arg = sys.argv[idx + 1]
+
+    # Pre-cache/resolve location early, prompting if interactive and not resolved
+    get_location_config(root_dir, country_arg=country_arg, state_arg=state_arg)
 
     if not WEBSOCKET_AVAILABLE:
         print("Error: websocket-client not installed.")
@@ -800,8 +1432,10 @@ def main():
 
         for ds in sorted(dates_with_missing, key=lambda d: datetime.strptime(d, '%d %b %Y')):
             pd = rpt['per_date'][ds]
+            counts_map = load_species_counts(rpt['folder'])
             log(f"  {ds}: filling {len(pd['missing'])} species into {pd['best_cl']}")
-            result = auto_fill_checklist(pd['best_cl'], pd['missing'])
+            folder_country, folder_state = get_location_config(rpt['folder'])
+            result = auto_fill_checklist(pd['best_cl'], pd['missing'], counts_map=counts_map, country_code=folder_country)
             if result['ok']:
                 log(f"    ✅ Added: {', '.join(result['ok'])}")
             if result['no_match']:

@@ -17,10 +17,14 @@ if _TOOLS_DIR not in sys.path:
 
 # Step 7 auto-fill — imported from companion script
 try:
-    from ebird_add_missing_species import run_add_missing_species
+    from ebird_add_missing_species import run_add_missing_species, is_species_plausible_for_location, extract_species_and_location, get_location_config, find_exiftool_path
     ADD_MISSING_AVAILABLE = True
 except ImportError:
     ADD_MISSING_AVAILABLE = False
+    is_species_plausible_for_location = None
+    extract_species_and_location = None
+    get_location_config = None
+    find_exiftool_path = None
 
 # Optional dependencies will be verified at runtime
 try:
@@ -38,7 +42,10 @@ except ImportError:
     websocket = None
     WEBSOCKET_AVAILABLE = False
 
-ET_PATH = 'C:/workspace/SuperPicky/exiftools_win/exiftool.exe'
+if find_exiftool_path:
+    ET_PATH = find_exiftool_path()
+else:
+    ET_PATH = 'C:/workspace/SuperPicky/exiftools_win/exiftool.exe'
 
 def log(msg):
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -463,25 +470,36 @@ def run_check_missing_species(target_dir, target_dates):
     checklist_species = {}  # url -> set[str]
     all_cl_urls = [url for urls in found_checklists.values() for url in urls]
 
+    detected_country = None
+    detected_state = None
+
     if all_cl_urls:
         log(f"Scanning {len(all_cl_urls)} checklists for species lists...")
         for cl_url in all_cl_urls:
             log(f"  → {cl_url}")
             try:
-                tab = open_tab(cl_url)
-                time.sleep(4)
-                tab_ws = websocket.create_connection(tab['webSocketDebuggerUrl'], origin='http://localhost:9222')
-                r = send_ws(tab_ws, 'Runtime.evaluate', {'expression': '''(function(){
-                    var names = new Set();
-                    document.querySelectorAll("a[href*='/species/']").forEach(e => names.add(e.innerText.trim()));
-                    document.querySelectorAll(".Obs-species .Heading, .SpeciesName").forEach(e => names.add(e.innerText.trim()));
-                    document.querySelectorAll(".Obs .Heading").forEach(e => names.add(e.innerText.trim()));
-                    return JSON.stringify([...names].filter(s => s.length > 2));
-                })()''', 'returnByValue': True})
-                val_str = r.get('result', {}).get('result', {}).get('value', '[]')
-                checklist_species[cl_url] = set(json.loads(val_str))
-                tab_ws.close()
-                close_tab(tab['id'])
+                if extract_species_and_location:
+                    species_set, loc = extract_species_and_location(cl_url)
+                    checklist_species[cl_url] = species_set
+                    if not detected_country and loc.get('country') and loc.get('state'):
+                        detected_country = loc['country']
+                        detected_state = loc['state']
+                        log(f"    🌍 Detected eBird location: {detected_state}, {detected_country}")
+                else:
+                    tab = open_tab(cl_url)
+                    time.sleep(4)
+                    tab_ws = websocket.create_connection(tab['webSocketDebuggerUrl'], origin='http://localhost:9222')
+                    r = send_ws(tab_ws, 'Runtime.evaluate', {'expression': '''(function(){
+                        var names = new Set();
+                        document.querySelectorAll("a[href*='/species/']").forEach(e => names.add(e.innerText.trim()));
+                        document.querySelectorAll(".Obs-species .Heading, .SpeciesName").forEach(e => names.add(e.innerText.trim()));
+                        document.querySelectorAll(".Obs .Heading").forEach(e => names.add(e.innerText.trim()));
+                        return JSON.stringify([...names].filter(s => s.length > 2));
+                    })()''', 'returnByValue': True})
+                    val_str = r.get('result', {}).get('result', {}).get('value', '[]')
+                    checklist_species[cl_url] = set(json.loads(val_str))
+                    tab_ws.close()
+                    close_tab(tab['id'])
             except Exception as e:
                 log(f"  ⚠️ Error scanning {cl_url}: {e}")
 
@@ -490,7 +508,30 @@ def run_check_missing_species(target_dir, target_dates):
     for sp_set in checklist_species.values():
         all_ebird_species.update(sp_set)
 
-    missing = photographed - all_ebird_species
+    # Load from folder location config if eBird location scraping failed
+    folder_country = detected_country
+    folder_state = detected_state
+    if get_location_config and (not folder_country or not folder_state):
+        folder_country, folder_state = get_location_config(target_dir)
+
+    unique_months = []
+    if target_dates:
+        for d_str in target_dates:
+            try:
+                m_num = datetime.strptime(d_str, '%d %b %Y').month
+                if m_num not in unique_months:
+                    unique_months.append(m_num)
+            except Exception:
+                pass
+
+    missing_raw = photographed - all_ebird_species
+    missing = set()
+    flagged = set()
+    for sp in missing_raw:
+        if is_species_plausible_for_location and is_species_plausible_for_location(sp, target_dir, country=folder_country, state=folder_state, month=unique_months):
+            missing.add(sp)
+        else:
+            flagged.add(sp)
 
     # ── 6. Print actionable report ─────────────────────────────────────────────
     sep = "═" * 62
@@ -511,8 +552,13 @@ def run_check_missing_species(target_dir, target_dates):
         print(f"\n  💡  Add these species to your checklists before uploading media.")
         print(f"  → Your checklists: https://ebird.org/mychecklists")
     elif not dates_no_checklist:
-        print(f"\n  ✅  All {len(photographed)} photographed species are present in your eBird checklists!")
+        print(f"\n  ✅  All photographed species are present in your eBird checklists!")
         print(f"  Ready to upload media.")
+
+    if flagged:
+        print(f"\n  ⚠️  Flagged & Ignored ({len(flagged)} species):")
+        for sp in sorted(flagged):
+            print(f"       • {sp}")
 
     if found_checklists:
         print(f"\n  📂  Checklists checked ({sum(len(v) for v in found_checklists.values())} total):")
@@ -644,7 +690,7 @@ def run_ebird_upload_highlight(target_dir, target_dates):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python ebird_pipeline.py <target_root_folder> [--skip-rating]")
+        print("Usage: python ebird_pipeline.py <target_root_folder> [--skip-rating] [--country <CODE>] [--state <NAME>]")
         sys.exit(1)
         
     target_dir = os.path.abspath(sys.argv[1])
@@ -653,6 +699,21 @@ def main():
     if not os.path.isdir(target_dir):
         print(f"Error: Target directory does not exist: {target_dir}")
         sys.exit(1)
+
+    country_arg = None
+    state_arg = None
+    if "--country" in sys.argv:
+        idx = sys.argv.index("--country")
+        if idx + 1 < len(sys.argv):
+            country_arg = sys.argv[idx + 1]
+    if "--state" in sys.argv:
+        idx = sys.argv.index("--state")
+        if idx + 1 < len(sys.argv):
+            state_arg = sys.argv[idx + 1]
+
+    # Pre-cache/resolve location early, prompting if interactive and not resolved
+    if get_location_config:
+        get_location_config(target_dir, country_arg=country_arg, state_arg=state_arg)
         
     log("==========================================================")
     log("🐦 Optimized eBird Unified Import & Processing Pipeline")
